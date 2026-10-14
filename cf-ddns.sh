@@ -11,6 +11,7 @@ umask 077
 # installed path, so the next boot's curl -o never truncates a live service script.
 ENTRY=/usr/local/bin/cf-ddns.sh
 SELF=/usr/local/lib/cf-ddns/runner.sh
+VERSION=2026.10.14-wildcard
 CONF=/etc/cf-ddns.json
 RUN=/var/run/cf-ddns
 STATE=/var/lib/cf-ddns
@@ -166,12 +167,20 @@ load_config() {
     [ "${#TOKEN}" -ge 10 ] && [ "${#TOKEN}" -le 256 ] || die 'Token 长度无效。'
     case "$ZONE" in *[!A-Fa-f0-9]*|'') die 'Zone ID 必须是 32 位十六进制字符串。';; esac
     [ "${#ZONE}" = 32 ] || die 'Zone ID 长度不是 32。'
-    printf '%s\n' "$NAME" | awk '
+    [ "${#NAME}" -le 253 ] || die '完整记录域名长度不能超过 253。'
+    # A wildcard is exactly the first label, e.g. *.example.com or *.sub.example.com.
+    # Keep NAME intact for JSON and exact-match filtering; validate its suffix only.
+    case "$NAME" in
+        \*.*) base_name=${NAME#\*.};;
+        *) base_name=$NAME;;
+    esac
+    printf '%s\n' "$base_name" | awk '
       NR!=1 || length($0)>253 || index($0,".")==0 {exit 1}
       {n=split($0,a,"."); for(i=1;i<=n;i++) {
         if(length(a[i])<1 || length(a[i])>63 || a[i] !~ /^[a-z0-9-]+$/ ||
            substr(a[i],1,1)=="-" || substr(a[i],length(a[i]),1)=="-") exit 1
-      }}' || die '域名格式无效；请输入完整域名，国际化域名使用 Punycode。'
+      }}' || die '域名格式无效；支持完整域名及 *.example.com，* 只能作为最左侧独立标签；国际化域名使用 Punycode。'
+    QUERY_NAME=$(jq -rn --arg n "$NAME" '$n | @uri') || die '域名查询参数编码失败。'
     if [ "$PROXIED" = true ] && [ "$TTL" != 1 ]; then
         TTL=1 # Cloudflare proxied records use automatic TTL.
     fi
@@ -252,7 +261,7 @@ cf_api() {
     fi
 }
 list_records() {
-    cf_api GET "/zones/$ZONE/dns_records?type=A&name=$NAME&per_page=100&page=1" || return 1
+    cf_api GET "/zones/$ZONE/dns_records?type=A&name.exact=$QUERY_NAME&match=all&per_page=100&page=1" || return 1
     jq -e '(.result|type)=="array" and ((.result_info.total_pages // 1)<=1)' "$WORK/response" >/dev/null || {
         log ERROR '记录列表无效或超过一页；停止修改，避免遗漏/误删。'; return 1;
     }
@@ -486,6 +495,7 @@ RC
 }
 install_main() {
     dirs
+    log INFO "cf-ddns $VERSION：自动安装/修复。"
     # mkdir is a bootstrap lock because flock may not yet be installed.
     if ! mkdir "$RUN/bootstrap-install" 2>/dev/null; then
         die "已有安装正在运行；若上次被强制断电，请确认无安装进程后删除 $RUN/bootstrap-install。"
@@ -539,14 +549,17 @@ usage() {
   /usr/local/bin/cf-ddns.sh --once              立即同步一次，显示结果
   /usr/local/bin/cf-ddns.sh --status            查看配置、服务、定时任务及上次成功状态
   /usr/local/bin/cf-ddns.sh --logs              查看日志
+  /usr/local/bin/cf-ddns.sh --version           查看脚本版本
 
 仅管理指定完整域名的 A 记录。默认 DNS only、TTL=60、间隔=60 秒。
+支持泛域名，例如 *.example.com、*.sub.example.com；参数请加引号。
 默认清理该域名重复 A 记录；其它域名、AAAA/MX/TXT 等不处理。
 凭据存于 /etc/cf-ddns.json（600），不会执行配置里的 shell 代码。
 HELP
 }
 case "${1:---default}" in
     --help|-h) usage;;
+    --version) printf '%s\n' "$VERSION";;
     --install) shift; root_check; [ "$#" = 0 ] || [ "$#" = 3 ] || die '安装需要 0 或 3 个参数。'; install_main "$@";;
     --configure) shift; root_check; [ "$#" = 3 ] || die '修改配置需要三个参数。'; runtime_deps; dirs
         exec 6>"$RUN/install.lock"; flock -x 6
