@@ -11,7 +11,7 @@ umask 077
 # installed path, so the next boot's curl -o never truncates a live service script.
 ENTRY=/usr/local/bin/cf-ddns.sh
 SELF=/usr/local/lib/cf-ddns/runner.sh
-VERSION=2026.10.14-wildcard
+VERSION=2026.10.14-sysvfix
 CONF=/etc/cf-ddns.json
 RUN=/var/run/cf-ddns
 STATE=/var/lib/cf-ddns
@@ -94,6 +94,7 @@ deps_ready() {
         for cmd in rc-service rc-update start-stop-daemon crond; do command -v "$cmd" >/dev/null 2>&1 || return 1; done
     elif [ -f /etc/debian_version ]; then
         command -v cron >/dev/null 2>&1 || return 1
+        command -v update-rc.d >/dev/null 2>&1 || return 1
     else
         return 1
     fi
@@ -126,7 +127,7 @@ install_deps() {
         package_step apt-get -o Acquire::Retries=3 update || die 'apt 软件源更新失败。'
         package_step env DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get \
           -o DPkg::Lock::Timeout=120 -o Acquire::Retries=3 -o Dpkg::Options::=--force-confold \
-          install -y curl jq ca-certificates util-linux coreutils cron || die 'Debian 依赖安装失败。'
+          install -y curl jq ca-certificates util-linux coreutils cron init-system-helpers || die 'Debian 依赖安装失败。'
     else
         die '本安装器支持 Debian 和 Alpine。'
     fi
@@ -416,9 +417,40 @@ watchdog() {
     "$SELF" --run 4>&- 5>&- 6>&-
 }
 
+service_step() {
+    if "$@" >"$RUN/service-step.log" 2>&1; then
+        return 0
+    else
+        svc_rc=$?
+        log ERROR '服务注册步骤失败；服务管理器最近输出：'
+        tail -n 15 "$RUN/service-step.log" | while IFS= read -r svc_line; do log ERROR "$svc_line"; done
+        return "$svc_rc"
+    fi
+}
+migrate_sysv() {
+    # systemctl enable synchronizes any same-name /etc/init.d script, even when
+    # a native unit exists. Malformed/OpenRC scripts then fail in update-rc.d.
+    # Preserve the legacy artifact outside init.d instead of editing its headers.
+    if [ -e /etc/init.d/cf-ddns ] || [ -L /etc/init.d/cf-ddns ]; then
+        log WARN '发现同名旧初始化脚本，将备份并迁移到原生 systemd 服务。'
+        if systemctl is-active --quiet cf-ddns.service; then
+            if ! service_step systemctl stop cf-ddns.service; then
+                die '旧服务停止失败，尚未移动其初始化脚本；请查看日志。'
+            fi
+        fi
+        mkdir -p "$STATE/legacy-init" || die '无法创建旧服务备份目录。'
+        legacy_backup=$(mktemp "$STATE/legacy-init/cf-ddns.XXXXXX") || die '无法创建旧服务备份文件。'
+        mv -f /etc/init.d/cf-ddns "$legacy_backup" || die '备份旧初始化脚本失败。'
+        log INFO "旧初始化脚本已备份：$legacy_backup"
+    fi
+    # Also repairs leftover runlevel links on a retry after an interrupted migration.
+    command -v update-rc.d >/dev/null 2>&1 || die '缺少 update-rc.d，请重新运行安装以修复依赖。'
+    service_step update-rc.d -f cf-ddns remove || die '清理旧 SysV 启动链接失败。'
+}
 install_service() {
     mgr=$(manager) || die '没有运行中的服务管理器。'
     if [ "$mgr" = systemd ]; then
+        migrate_sysv
         cat >"$WORK/cf-ddns.service" <<'UNIT'
 [Unit]
 Description=Cloudflare IPv4 DDNS
@@ -441,7 +473,9 @@ WantedBy=multi-user.target
 UNIT
         chmod 644 "$WORK/cf-ddns.service"
         mv -f "$WORK/cf-ddns.service" /etc/systemd/system/cf-ddns.service || die '安装 systemd 服务失败。'
-        systemctl daemon-reload && systemctl enable cf-ddns.service && systemctl restart cf-ddns.service || die '启动 systemd 服务失败。'
+        service_step systemctl daemon-reload || die '重新加载 systemd 配置失败。'
+        service_step systemctl enable cf-ddns.service || die '启用 systemd 开机启动失败。'
+        service_step systemctl restart cf-ddns.service || die '启动 systemd 服务失败。'
         cat >"$WORK/cron" <<'CRON'
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -450,7 +484,7 @@ CRON
         chmod 644 "$WORK/cron"
         mkdir -p /etc/cron.d
         mv -f "$WORK/cron" /etc/cron.d/cf-ddns || die '安装 Cron 失败。'
-        systemctl enable --now cron.service || die '启用 cron 失败。'
+        service_step systemctl enable --now cron.service || die '启用 cron 失败。'
     else
         interpreter=/sbin/openrc-run
         [ -x "$interpreter" ] || interpreter=/sbin/runscript
@@ -481,7 +515,7 @@ RC
         fi
         chmod 755 "$WORK/service"
         mv -f "$WORK/service" /etc/init.d/cf-ddns || die '安装 OpenRC 服务失败。'
-        rc-update add cf-ddns default && rc-service cf-ddns restart || die '启动 OpenRC 服务失败。'
+        service_step rc-update add cf-ddns default && service_step rc-service cf-ddns restart || die '启动 OpenRC 服务失败。'
         # BusyBox crond reads root's crontab, not Debian's /etc/cron.d format.
         crontab -l >"$WORK/old-cron" 2>/dev/null || :
         awk 'index($0,"# cf-ddns-managed")==0' "$WORK/old-cron" >"$WORK/cron"
@@ -489,7 +523,7 @@ RC
         crontab "$WORK/cron" || die '写入 root crontab 失败。'
         # Remove the exact legacy cron.d artifact from the supplied original script.
         rm -f /etc/cron.d/cf-ddns
-        rc-update add crond default && rc-service crond start || die '启动 crond 失败。'
+        service_step rc-update add crond default && service_step rc-service crond start || die '启动 crond 失败。'
     fi
     log INFO '已注册开机启动、进程守护和每分钟定时巡检；重复安装覆盖同一份服务/任务。'
 }
