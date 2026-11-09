@@ -11,7 +11,7 @@ umask 077
 # installed path, so the next boot's curl -o never truncates a live service script.
 ENTRY=/usr/local/bin/cf-ddns.sh
 SELF=/usr/local/lib/cf-ddns/runner.sh
-VERSION=2026.11.09-dualstack
+VERSION=2026.11.09-wildcard-aliases
 CONF=/etc/cf-ddns.json
 RUN=/var/run/cf-ddns
 STATE=/var/lib/cf-ddns
@@ -348,12 +348,38 @@ sync_once() {
         # A failure in one family must not prevent the other family syncing.
         sync_record || sync_rc=1
     done
+    case "$NAME" in
+        \*.*)
+            suffix=${NAME#\*.}
+            sync_alias "v4.$suffix" A "$IPV4" || sync_rc=1
+            sync_alias "v6.$suffix" AAAA "$IPV6" || sync_rc=1;;
+    esac
     [ "$sync_rc" = 0 ] || return 1
     # State is informational only; empty means unavailable in this cycle.
     jq -n --arg ipv4 "$IPV4" --arg ipv6 "$IPV6" --arg n "$NAME" --arg at "$(date '+%Y-%m-%d %H:%M:%S%z')" \
       '{record_name:$n,ipv4:$ipv4,ipv6:$ipv6,last_success:$at}' >"$WORK/state" && \
       mv -f "$WORK/state" "$STATE/status.json" || return 1
 }
+# Subshell keeps the original wildcard name and proxy settings intact.
+sync_alias() (
+    trap - EXIT
+    NAME=$1; TYPE=$2; IP=$3
+    if [ -z "$IP" ]; then
+        log WARN "$NAME：对应地址族不可用，保留旧记录；若该名字从未创建，仍可能匹配泛域名。"
+        return 0
+    fi
+    QUERY_NAME=$(jq -rn --arg n "$NAME" '$n | @uri') || return 1
+    PROXIED=false # Single-stack aliases must expose the origin, not CDN addresses.
+    cf_api GET "/zones/$ZONE/dns_records?name.exact=$QUERY_NAME&match=all&per_page=100&page=1" || return 1
+    jq -e --arg n "$NAME" --arg type "$TYPE" '
+      (.result|type)=="array" and ((.result_info.total_pages // 1)<=1) and
+      all(.result[]; .name==$n and .type==$type)
+    ' "$WORK/response" >/dev/null 2>&1 || {
+        log ERROR "$NAME 存在非预期类型记录或列表不完整；不覆盖、不删除，请先人工核对。"
+        return 1
+    }
+    sync_record
+)
 sync_record() {
     list_records || return 1
     count=$(jq length "$WORK/records")
@@ -643,8 +669,11 @@ usage() {
 
 管理指定完整域名的 A/AAAA 记录，自动探测公网 IPv4/IPv6。默认 DNS only、TTL=60、间隔=60 秒。
 支持泛域名，例如 *.example.com、*.sub.example.com；参数请加引号。
+泛域名额外维护 v4.<去掉*.后的域名> 仅 A、v6.<去掉*.后的域名> 仅 AAAA，均为 DNS only。
+单栈入口若已有非预期类型记录则拒绝修改，需人工核对，不自动删除。
 可用地址族分别同步；未探测到的地址族跳过并保留旧记录，不自动删除。
-默认分别清理该域名重复 A/AAAA 记录；其它域名、MX/TXT 等不处理。
+若单栈入口从未创建且本轮无对应地址，该名字仍可能匹配原泛域名，不能当作已建立的单栈入口。
+默认分别清理受管名字的同类型重复记录；除上述单栈入口外，其它域名、MX/TXT 等不处理。
 凭据存于 /etc/cf-ddns.json（600），不会执行配置里的 shell 代码。
 HELP
 }
