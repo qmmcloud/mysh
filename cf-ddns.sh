@@ -1,5 +1,5 @@
 #!/bin/sh
-# Cloudflare IPv4 DDNS: POSIX sh, systemd/OpenRC, single-instance reconciliation.
+# Cloudflare IPv4/IPv6 DDNS: POSIX sh, systemd/OpenRC, single-instance reconciliation.
 # Existing boot command: /usr/local/bin/cf-ddns.sh TOKEN ZONE_ID FQDN
 # No eval/source of configuration; no tokens in curl arguments; no blind POST retries.
 set -u
@@ -11,7 +11,7 @@ umask 077
 # installed path, so the next boot's curl -o never truncates a live service script.
 ENTRY=/usr/local/bin/cf-ddns.sh
 SELF=/usr/local/lib/cf-ddns/runner.sh
-VERSION=2026.10.14-sysvfix
+VERSION=2026.11.09-dualstack
 CONF=/etc/cf-ddns.json
 RUN=/var/run/cf-ddns
 STATE=/var/lib/cf-ddns
@@ -225,24 +225,68 @@ valid_ipv4() {
          ($1==198 && ($2==18 || $2==19 || ($2==51 && $3==100))) ||
          ($1==203 && $2==0 && $3==113)) exit 1}'
 }
-public_ipv4() {
-    for endpoint in https://www.cloudflare.com/cdn-cgi/trace https://api.ipify.org https://ipv4.icanhazip.com; do
-        if answer=$(curl -q -4 --noproxy '*' -fsS --connect-timeout 5 --max-time 10 "$endpoint" 2>"$WORK/ip-error"); then
+# Validate globally routable IPv6 (2000::/3) and normalize to RFC 5952.
+normalize_ipv6() {
+    printf '%s\n' "$1" | awk '
+      NR!=1 {exit 1}
+      {
+        s=tolower($0)
+        if(s !~ /^[23][0-9a-f:]+$/ || s ~ /:::/) exit 1
+        compressed=index(s,"::")
+        if(compressed) {
+          left=substr(s,1,compressed-1); right=substr(s,compressed+2)
+          if(index(right,"::")) exit 1
+          nl=split(left,l,":"); nr=(right=="" ? 0 : split(right,r,":"))
+          if(nl+nr>=8) exit 1
+          for(i=1;i<=nl;i++) a[i]=l[i]
+          for(i=nl+1;i<=8-nr;i++) a[i]="0"
+          for(i=1;i<=nr;i++) a[8-nr+i]=r[i]
+        } else if(split(s,a,":")!=8) exit 1
+        for(i=1;i<=8;i++) {
+          if(length(a[i])<1 || length(a[i])>4 || a[i] !~ /^[0-9a-f]+$/) exit 1
+          sub(/^0+/,"",a[i]); if(a[i]=="") a[i]="0"
+        }
+        if(a[1]=="2001" && a[2]=="db8") exit 1
+        best=0; longest=1
+        for(i=1;i<=8;i++) if(a[i]=="0") {
+          start=i; while(i<=8 && a[i]=="0") i++
+          if(i-start>longest) {best=start; longest=i-start}
+        }
+        out=""
+        for(i=1;i<=8;i++) {
+          if(i==best) {out=out "::"; i+=longest-1}
+          else {if(out!="" && substr(out,length(out),1)!=":") out=out ":"; out=out a[i]}
+        }
+        print out
+      }'
+}
+public_ip() {
+    family=$1
+    case "$family" in
+        4) endpoints='https://www.cloudflare.com/cdn-cgi/trace https://api.ipify.org https://ipv4.icanhazip.com';;
+        6) endpoints='https://www.cloudflare.com/cdn-cgi/trace https://api6.ipify.org https://ipv6.icanhazip.com';;
+    esac
+    for endpoint in $endpoints; do
+        if answer=$(curl -q "-$family" --noproxy '*' -fsS --connect-timeout 5 --max-time 10 "$endpoint" 2>"$WORK/ip-error"); then
             case "$endpoint" in
                 *cdn-cgi/trace) candidate=$(printf '%s\n' "$answer" | sed -n 's/^ip=//p' | tr -d '\r');;
                 *) candidate=$(printf '%s' "$answer" | tr -d '\r\n');;
             esac
-            if valid_ipv4 "$candidate"; then printf '%s\n' "$candidate"; return 0; fi
+            if [ "$family" = 4 ]; then
+                if valid_ipv4 "$candidate"; then printf '%s\n' "$candidate"; return 0; fi
+            elif candidate=$(normalize_ipv6 "$candidate"); then
+                printf '%s\n' "$candidate"; return 0
+            fi
         fi
     done
-    log ERROR '所有公网 IPv4 检测源均失败或返回无效地址；保留现有 DNS，下一轮重试。'
+    log WARN "未探测到有效公网 IPv$family；跳过该地址族并保留现有记录，下一轮重试。"
     return 1
 }
 
 # API response lives at $WORK/response. Never retry a mutation blindly.
 cf_api() {
     method=$1; route=$2; body=${3:-}
-    set -- -q -4 --noproxy '*' -sS --connect-timeout 5 --max-time 20 \
+    set -- -q --noproxy '*' -sS --connect-timeout 5 --max-time 20 \
       --config "$WORK/auth" -X "$method" -o "$WORK/response" -w '%{http_code}'
     [ -z "$body" ] || set -- "$@" --data-binary "@$body"
     if ! code=$(curl "$@" "$API$route" 2>"$WORK/api-error"); then
@@ -262,16 +306,16 @@ cf_api() {
     fi
 }
 list_records() {
-    cf_api GET "/zones/$ZONE/dns_records?type=A&name.exact=$QUERY_NAME&match=all&per_page=100&page=1" || return 1
+    cf_api GET "/zones/$ZONE/dns_records?type=$TYPE&name.exact=$QUERY_NAME&match=all&per_page=100&page=1" || return 1
     jq -e '(.result|type)=="array" and ((.result_info.total_pages // 1)<=1)' "$WORK/response" >/dev/null || {
         log ERROR '记录列表无效或超过一页；停止修改，避免遗漏/误删。'; return 1;
     }
     # Also filter exact type/name locally; use only result[].id.
-    jq --arg n "$NAME" '[.result[] | select(.type=="A" and .name==$n)]' "$WORK/response" >"$WORK/records" || return 1
+    jq --arg n "$NAME" --arg type "$TYPE" '[.result[] | select(.type==$type and .name==$n)]' "$WORK/response" >"$WORK/records" || return 1
 }
 result_matches() {
-    jq -e --arg n "$NAME" --arg ip "$IP" --arg t "$TTL" --arg p "$PROXIED" \
-      '.result.type=="A" and .result.name==$n and .result.content==$ip and .result.ttl==($t|tonumber) and .result.proxied==($p=="true")' \
+    jq -e --arg type "$TYPE" --arg n "$NAME" --arg ip "$IP" --arg t "$TTL" --arg p "$PROXIED" \
+      '.result.type==$type and .result.name==$n and .result.content==$ip and .result.ttl==($t|tonumber) and .result.proxied==($p=="true")' \
       "$WORK/response" >/dev/null 2>&1
 }
 sync_once() {
@@ -294,15 +338,31 @@ sync_once() {
     load_config
     WORK=$(mktemp -d "$RUN/work.XXXXXX") || die '无法创建工作目录。'
     printf 'header = "Authorization: Bearer %s"\nheader = "Content-Type: application/json"\n' "$TOKEN" >"$WORK/auth"
-    IP=$(public_ipv4) || return 1
+    IPV4=$(public_ip 4) || IPV4=
+    IPV6=$(public_ip 6) || IPV6=
+    [ -n "$IPV4$IPV6" ] || return 1
+    sync_rc=0
+    for TYPE in A AAAA; do
+        case "$TYPE" in A) IP=$IPV4;; AAAA) IP=$IPV6;; esac
+        [ -n "$IP" ] || continue
+        # A failure in one family must not prevent the other family syncing.
+        sync_record || sync_rc=1
+    done
+    [ "$sync_rc" = 0 ] || return 1
+    # State is informational only; empty means unavailable in this cycle.
+    jq -n --arg ipv4 "$IPV4" --arg ipv6 "$IPV6" --arg n "$NAME" --arg at "$(date '+%Y-%m-%d %H:%M:%S%z')" \
+      '{record_name:$n,ipv4:$ipv4,ipv6:$ipv6,last_success:$at}' >"$WORK/state" && \
+      mv -f "$WORK/state" "$STATE/status.json" || return 1
+}
+sync_record() {
     list_records || return 1
     count=$(jq length "$WORK/records")
     if [ "$count" -gt 1 ] && [ "$CLEAN_DUP" != true ]; then
-        log ERROR "发现 $count 条同名 A 记录；cleanup_duplicates=false，已停止修改。"
+        log ERROR "发现 $count 条同名 $TYPE 记录；cleanup_duplicates=false，已停止修改。"
         return 1
     fi
-    jq -n --arg n "$NAME" --arg ip "$IP" --arg t "$TTL" --arg p "$PROXIED" \
-      '{type:"A",name:$n,content:$ip,ttl:($t|tonumber),proxied:($p=="true")}' >"$WORK/body" || return 1
+    jq -n --arg type "$TYPE" --arg n "$NAME" --arg ip "$IP" --arg t "$TTL" --arg p "$PROXIED" \
+      '{type:$type,name:$n,content:$ip,ttl:($t|tonumber),proxied:($p=="true")}' >"$WORK/body" || return 1
     action=无需修改
     if [ "$count" = 0 ]; then
         cf_api POST "/zones/$ZONE/dns_records" "$WORK/body" || return 1
@@ -327,7 +387,7 @@ sync_once() {
                 case "$extra_id" in ''|*[!A-Fa-f0-9]*) return 1;; esac
                 [ "${#extra_id}" = 32 ] || return 1
                 cf_api DELETE "/zones/$ZONE/dns_records/$extra_id" || return 1
-                log WARN "已删除指定域名 $NAME 的重复 A 记录：$extra_id"
+                log WARN "已删除指定域名 $NAME 的重复 $TYPE 记录：$extra_id"
             done <"$WORK/extras"
         fi
     fi
@@ -336,15 +396,11 @@ sync_once() {
         list_records || return 1
         jq -e --arg ip "$IP" --arg t "$TTL" --arg p "$PROXIED" \
           'length==1 and .[0].content==$ip and .[0].ttl==($t|tonumber) and .[0].proxied==($p=="true")' "$WORK/records" >/dev/null || {
-            log ERROR '写入后的核对失败：未形成唯一且正确的 A 记录；下一轮重试。'; return 1;
+            log ERROR "写入后的核对失败：未形成唯一且正确的 $TYPE 记录；下一轮重试。"; return 1;
         }
     fi
-    # State is informational only: never skip Cloudflare based on a cached IP.
-    jq -n --arg ip "$IP" --arg n "$NAME" --arg at "$(date '+%Y-%m-%d %H:%M:%S%z')" \
-      '{record_name:$n,ipv4:$ip,last_success:$at}' >"$WORK/state" && \
-      mv -f "$WORK/state" "$STATE/status.json" || return 1
     if [ "$quiet" != yes ] || [ "$action" != 无需修改 ] || [ "$count" -gt 1 ]; then
-        log INFO "$action：$NAME → $IP；TTL=$TTL，代理=$PROXIED，A 记录数=1。"
+        log INFO "$action：$NAME → $IP；TTL=$TTL，代理=$PROXIED，$TYPE 记录数=1。"
     fi
 }
 
@@ -453,7 +509,7 @@ install_service() {
         migrate_sysv
         cat >"$WORK/cf-ddns.service" <<'UNIT'
 [Unit]
-Description=Cloudflare IPv4 DDNS
+Description=Cloudflare IPv4/IPv6 DDNS
 Wants=network-online.target
 After=network-online.target
 StartLimitIntervalSec=0
@@ -492,7 +548,7 @@ CRON
         printf '#!%s\n' "$interpreter" >"$WORK/service"
         if command -v supervise-daemon >/dev/null 2>&1; then
             cat >>"$WORK/service" <<'RC'
-description="Cloudflare IPv4 DDNS"
+description="Cloudflare IPv4/IPv6 DDNS"
 supervisor="supervise-daemon"
 command="/usr/local/lib/cf-ddns/runner.sh"
 command_args="--daemon"
@@ -504,7 +560,7 @@ depend() { need net; use dns logger; }
 RC
         else
             cat >>"$WORK/service" <<'RC'
-description="Cloudflare IPv4 DDNS (legacy OpenRC)"
+description="Cloudflare IPv4/IPv6 DDNS (legacy OpenRC)"
 command="/usr/local/lib/cf-ddns/runner.sh"
 command_args="--supervise"
 command_background=true
@@ -561,7 +617,7 @@ show_status() {
     printf '脚本：%s\n配置：%s\n' "$SELF" "$CONF"
     if [ -f "$CONF" ]; then
         load_config
-        printf '域名：%s\n间隔：%s 秒（每轮完成后）\nTTL：%s\nCloudflare 代理：%s\n清理同名重复 A：%s\n' "$NAME" "$INTERVAL" "$TTL" "$PROXIED" "$CLEAN_DUP"
+        printf '域名：%s\n间隔：%s 秒（每轮完成后）\nTTL：%s\nCloudflare 代理：%s\n清理同名重复 A/AAAA：%s\n' "$NAME" "$INTERVAL" "$TTL" "$PROXIED" "$CLEAN_DUP"
     fi
     case "$(manager)" in
         systemd) systemctl --no-pager --full status cf-ddns.service || :; printf '\n定时任务：\n'; cat /etc/cron.d/cf-ddns 2>/dev/null || :;;
@@ -570,7 +626,7 @@ show_status() {
     esac
     if [ -f "$STATE/status.json" ]; then
         printf '\n最近一次成功核对（不是实时状态）：\n'
-        jq -r '"域名：\(.record_name)\nIPv4：\(.ipv4)\n时间：\(.last_success)"' "$STATE/status.json"
+        jq -r '"域名：\(.record_name)\nIPv4：\(.ipv4)\nIPv6：\(.ipv6 // "")\n时间：\(.last_success)"' "$STATE/status.json"
     fi
 }
 usage() {
@@ -585,9 +641,10 @@ usage() {
   /usr/local/bin/cf-ddns.sh --logs              查看日志
   /usr/local/bin/cf-ddns.sh --version           查看脚本版本
 
-仅管理指定完整域名的 A 记录。默认 DNS only、TTL=60、间隔=60 秒。
+管理指定完整域名的 A/AAAA 记录，自动探测公网 IPv4/IPv6。默认 DNS only、TTL=60、间隔=60 秒。
 支持泛域名，例如 *.example.com、*.sub.example.com；参数请加引号。
-默认清理该域名重复 A 记录；其它域名、AAAA/MX/TXT 等不处理。
+可用地址族分别同步；未探测到的地址族跳过并保留旧记录，不自动删除。
+默认分别清理该域名重复 A/AAAA 记录；其它域名、MX/TXT 等不处理。
 凭据存于 /etc/cf-ddns.json（600），不会执行配置里的 shell 代码。
 HELP
 }
